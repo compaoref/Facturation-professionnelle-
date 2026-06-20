@@ -1,20 +1,10 @@
-# -*- coding: utf-8 -*-
-"""
-FACTURAPRO v2.0 - Systeme de Gestion Commerciale & Facturation
-Revolucionnaire pour l'Afrique de l'Ouest
-Backend: Streamlit + Supabase (PostgreSQL)
-Frontend: Design professionnel inspire SAGE/Oxygene
-"""
-
 import streamlit as st
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool as pg_pool
 import hashlib
 import json
 import os
 from datetime import datetime, date
 import streamlit.components.v1 as components
+from supabase import create_client, Client
 
 st.set_page_config(
     page_title="FacturaPro — Gestion Commerciale",
@@ -28,228 +18,105 @@ st.set_page_config(
 # =============================================
 
 @st.cache_resource
-def get_pool():
+def get_supabase() -> Client:
     try:
-        if "DATABASE_URL" not in st.secrets:
-            return None
-        url = st.secrets["DATABASE_URL"]
-        p = pg_pool.ThreadedConnectionPool(
-            minconn=1, maxconn=5,
-            dsn=url, sslmode="require",
-            connect_timeout=10,
-            keepalives=1, keepalives_idle=30,
-            keepalives_interval=10, keepalives_count=5,
-        )
-        return p
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
     except Exception as e:
-        st.error(f"Erreur connexion BD: {e}")
         return None
 
 
 class DB:
     def __init__(self):
-        self._pool = get_pool()
-
-    def _conn(self):
-        if not self._pool:
-            return None
-        try:
-            return self._pool.getconn()
-        except Exception:
-            return None
-
-    def _release(self, conn):
-        if conn and self._pool:
-            try:
-                self._pool.putconn(conn)
-            except Exception:
-                pass
-
-    def init(self):
-        conn = self._conn()
-        if not conn:
-            return
-        try:
-            c = conn.cursor()
-            tables = [
-                """CREATE TABLE IF NOT EXISTS fp_users (
-                    id SERIAL PRIMARY KEY,
-                    nom TEXT, prenom TEXT,
-                    email TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT DEFAULT 'user',
-                    company_id INTEGER,
-                    status TEXT DEFAULT 'actif',
-                    created_at TIMESTAMP DEFAULT NOW()
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_companies (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    address TEXT, tel TEXT, email TEXT,
-                    website TEXT, ifu TEXT, rccm TEXT,
-                    bank TEXT, bank_account TEXT,
-                    currency TEXT DEFAULT 'XOF',
-                    logo_b64 TEXT,
-                    numbering_prefix TEXT DEFAULT 'FAC',
-                    numbering_seq INTEGER DEFAULT 1,
-                    owner_id INTEGER,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_clients (
-                    id SERIAL PRIMARY KEY,
-                    company_id INTEGER NOT NULL,
-                    code TEXT,
-                    name TEXT NOT NULL,
-                    address TEXT, tel TEXT, email TEXT,
-                    ifu TEXT, rccm TEXT,
-                    payment_terms TEXT DEFAULT '30j',
-                    credit_limit REAL DEFAULT 0,
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_products (
-                    id SERIAL PRIMARY KEY,
-                    company_id INTEGER NOT NULL,
-                    code TEXT, name TEXT NOT NULL,
-                    description TEXT,
-                    unit TEXT DEFAULT 'u',
-                    price REAL DEFAULT 0,
-                    tax_rate REAL DEFAULT 0,
-                    category TEXT,
-                    active INTEGER DEFAULT 1
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_invoices (
-                    id SERIAL PRIMARY KEY,
-                    company_id INTEGER NOT NULL,
-                    number TEXT NOT NULL,
-                    type TEXT DEFAULT 'invoice',
-                    client_id INTEGER,
-                    client_name TEXT,
-                    client_address TEXT,
-                    date_issue DATE DEFAULT CURRENT_DATE,
-                    date_due DATE,
-                    status TEXT DEFAULT 'draft',
-                    subtotal REAL DEFAULT 0,
-                    tax_total REAL DEFAULT 0,
-                    discount_total REAL DEFAULT 0,
-                    total REAL DEFAULT 0,
-                    amount_paid REAL DEFAULT 0,
-                    notes TEXT,
-                    payment_terms TEXT,
-                    layout_json TEXT,
-                    created_by INTEGER,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_invoice_lines (
-                    id SERIAL PRIMARY KEY,
-                    invoice_id INTEGER NOT NULL,
-                    position INTEGER DEFAULT 0,
-                    description TEXT,
-                    quantity REAL DEFAULT 1,
-                    unit TEXT DEFAULT 'u',
-                    unit_price REAL DEFAULT 0,
-                    discount_pct REAL DEFAULT 0,
-                    tax_rate REAL DEFAULT 0,
-                    total REAL DEFAULT 0
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_payments (
-                    id SERIAL PRIMARY KEY,
-                    invoice_id INTEGER NOT NULL,
-                    company_id INTEGER NOT NULL,
-                    amount REAL NOT NULL,
-                    method TEXT DEFAULT 'Especes',
-                    reference TEXT,
-                    date_payment DATE DEFAULT CURRENT_DATE,
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )""",
-                """CREATE TABLE IF NOT EXISTS fp_settings (
-                    id SERIAL PRIMARY KEY,
-                    company_id INTEGER UNIQUE,
-                    data_json TEXT DEFAULT '{}'
-                )""",
-            ]
-            for sql in tables:
-                c.execute(sql)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Init tables: {e}")
-        finally:
-            self._release(conn)
-
-    def q(self, sql, p=()):
-        sql = sql.replace("?", "%s")
-        conn = self._conn()
-        if not conn:
-            return False
-        try:
-            c = conn.cursor()
-            c.execute(sql, p)
-            conn.commit()
-            return True
-        except Exception as e:
-            conn.rollback()
-            return False
-        finally:
-            self._release(conn)
-
-    def q_id(self, sql, p=()):
-        """INSERT retournant l'id"""
-        sql = sql.replace("?", "%s")
-        if "RETURNING" not in sql.upper():
-            sql = sql.rstrip(";") + " RETURNING id"
-        conn = self._conn()
-        if not conn:
-            return None
-        try:
-            c = conn.cursor()
-            c.execute(sql, p)
-            row = c.fetchone()
-            conn.commit()
-            return row[0] if row else None
-        except Exception as e:
-            conn.rollback()
-            return None
-        finally:
-            self._release(conn)
-
-    def f1(self, sql, p=()):
-        sql = sql.replace("?", "%s")
-        conn = self._conn()
-        if not conn:
-            return None
-        try:
-            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            c.execute(sql, p)
-            r = c.fetchone()
-            return dict(r) if r else None
-        except Exception:
-            return None
-        finally:
-            self._release(conn)
-
-    def fa(self, sql, p=()):
-        sql = sql.replace("?", "%s")
-        conn = self._conn()
-        if not conn:
-            return []
-        try:
-            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            c.execute(sql, p)
-            return [dict(r) for r in c.fetchall()]
-        except Exception:
-            return []
-        finally:
-            self._release(conn)
+        self._sb = get_supabase()
 
     def is_connected(self):
         try:
-            r = self.f1("SELECT 1 AS ok")
-            return r is not None
+            if not self._sb:
+                return False
+            self._sb.table("fp_companies").select("id").limit(1).execute()
+            return True
         except Exception:
             return False
+
+    # ---- LECTURE ----
+    def fa(self, table, filters=None, order=None, limit=None):
+        """Retourne une liste de dicts depuis une table"""
+        try:
+            q = self._sb.table(table).select("*")
+            if filters:
+                for col, val in filters.items():
+                    q = q.eq(col, val)
+            if order:
+                q = q.order(order, desc=True)
+            if limit:
+                q = q.limit(limit)
+            r = q.execute()
+            return r.data if r.data else []
+        except Exception as e:
+            return []
+
+    def f1(self, table, filters=None):
+        """Retourne une seule ligne"""
+        rows = self.fa(table, filters=filters, limit=1)
+        return rows[0] if rows else None
+
+    def fa_sql(self, sql):
+        """Requete SQL brute via rpc (pour les requetes complexes)"""
+        try:
+            r = self._sb.rpc("run_sql", {"query": sql}).execute()
+            return r.data if r.data else []
+        except Exception:
+            return []
+
+    # ---- ECRITURE ----
+    def insert(self, table, data):
+        """INSERT - retourne la ligne inseree"""
+        try:
+            r = self._sb.table(table).insert(data).execute()
+            return r.data[0] if r.data else None
+        except Exception as e:
+            st.warning(f"Erreur insert {table}: {str(e)[:100]}")
+            return None
+
+    def update(self, table, data, filters):
+        """UPDATE"""
+        try:
+            q = self._sb.table(table).update(data)
+            for col, val in filters.items():
+                q = q.eq(col, val)
+            r = q.execute()
+            return True
+        except Exception as e:
+            st.warning(f"Erreur update {table}: {str(e)[:100]}")
+            return False
+
+    def delete(self, table, filters):
+        """DELETE"""
+        try:
+            q = self._sb.table(table).delete()
+            for col, val in filters.items():
+                q = q.eq(col, val)
+            q.execute()
+            return True
+        except Exception as e:
+            return False
+
+    def fa_filter(self, table, col, op, val):
+        """Filtre avec operateur: eq, neq, gt, lt, in_"""
+        try:
+            q = self._sb.table(table).select("*")
+            if op == "eq":   q = q.eq(col, val)
+            elif op == "neq": q = q.neq(col, val)
+            elif op == "gt":  q = q.gt(col, val)
+            elif op == "lt":  q = q.lt(col, val)
+            elif op == "in":  q = q.in_(col, val)
+            elif op == "ilike": q = q.ilike(col, f"%{val}%")
+            r = q.execute()
+            return r.data if r.data else []
+        except Exception:
+            return []
 
 
 db = DB()
@@ -295,9 +162,7 @@ for k, v in {
 # INIT DB
 # =============================================
 
-if "db_initialized" not in st.session_state:
-    db.init()
-    st.session_state.db_initialized = True
+# BD Supabase: tables créées manuellement via SQL Editor
 
 # =============================================
 # CSS GLOBAL PROFESSIONNEL
@@ -711,13 +576,17 @@ div[data-testid="stTabs"] [data-testid="stTab"] {
 
 def check_db():
     """Verifie et affiche etat BD"""
-    if "DATABASE_URL" not in st.secrets:
-        st.error("DATABASE_URL manquant dans les secrets Streamlit!")
-        st.code('''# Ajouter dans Settings → Secrets:
-DATABASE_URL = "postgresql://postgres.XXXX:MOT_DE_PASSE@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"''', language="toml")
+    if "SUPABASE_URL" not in st.secrets or "SUPABASE_KEY" not in st.secrets:
+        st.error("SUPABASE_URL et SUPABASE_KEY manquants dans les secrets Streamlit!")
+        st.code('''SUPABASE_URL = "https://XXXX.supabase.co"
+SUPABASE_KEY = "votre_anon_key_supabase"''', language="toml")
         st.stop()
     if not db.is_connected():
-        st.error("Impossible de se connecter a Supabase. Verifiez DATABASE_URL.")
+        st.error("Impossible de se connecter a Supabase.")
+        st.markdown("Verifiez SUPABASE_URL et SUPABASE_KEY dans Settings → Secrets")
+        st.code("""SUPABASE_URL = \"https://XXXX.supabase.co\"
+SUPABASE_KEY = \"votre_anon_key\"
+""", language="toml")
         if st.button("Reessayer"):
             st.rerun()
         st.stop()
@@ -749,13 +618,13 @@ def page_login():
 
             if st.button("Se connecter", type="primary", use_container_width=True):
                 if email and pwd:
-                    user = db.f1("SELECT * FROM fp_users WHERE email=? AND status='actif'", (email.lower(),))
+                    user = db.f1("fp_users", {"email": email.lower(), "status": "actif"})
                     if user and verify_pwd(pwd, safe(user, "password_hash")):
                         st.session_state.logged_in = True
                         st.session_state.user = user
                         company_id = safe(user, "company_id")
                         if company_id:
-                            st.session_state.company = db.f1("SELECT * FROM fp_companies WHERE id=?", (company_id,))
+                            st.session_state.company = db.f1("fp_companies", {"id": company_id})
                         st.session_state.page = "dashboard"
                         st.rerun()
                     else:
@@ -871,9 +740,9 @@ def page_dashboard():
         return
 
     # Stats
-    invoices = db.fa("SELECT * FROM fp_invoices WHERE company_id=?", (cid,))
-    clients  = db.fa("SELECT * FROM fp_clients  WHERE company_id=?", (cid,))
-    payments = db.fa("SELECT * FROM fp_payments WHERE company_id=?", (cid,))
+    invoices = db.fa("fp_invoices", {"company_id": cid})
+    clients  = db.fa("fp_clients",  {"company_id": cid})
+    payments = db.fa("fp_payments", {"company_id": cid})
 
     total_ca    = sum(safe(i, "total", 0) for i in invoices)
     total_paid  = sum(safe(i, "amount_paid", 0) for i in invoices)
@@ -924,7 +793,7 @@ def page_dashboard():
 
     with col_left:
         st.markdown("#### Dernieres Factures")
-        recent = sorted(invoices, key=lambda x: safe(x,"created_at",""), reverse=True)[:10]
+        recent = sorted(invoices, key=lambda x: str(safe(x,"created_at","")), reverse=True)[:10]
         if recent:
             table = '<table class="fp-table"><thead><tr><th>N°</th><th>Client</th><th>Date</th><th>Montant</th><th>Statut</th></tr></thead><tbody>'
             for inv in recent:
@@ -971,13 +840,13 @@ def page_new_invoice():
     st.markdown("#### Nouvelle Facture")
 
     # Recup numero suivant
-    company = db.f1("SELECT * FROM fp_companies WHERE id=?", (cid,))
+    company = db.f1("fp_companies", {"id": cid})
     prefix = safe(company, "numbering_prefix", "FAC")
     seq = safe(company, "numbering_seq", 1)
     invoice_number = f"{prefix}-{str(seq).zfill(4)}"
 
-    clients = db.fa("SELECT * FROM fp_clients WHERE company_id=?", (cid,))
-    products = db.fa("SELECT * FROM fp_products WHERE company_id=? AND active=1", (cid,))
+    clients = db.fa("fp_clients", {"company_id": cid})
+    products = db.fa("fp_products", {"company_id": cid, "active": 1})
 
     if "invoice_lines" not in st.session_state:
         st.session_state.invoice_lines = [{"desc": "", "qty": 1, "price": 0, "tax": 0, "disc": 0}]
@@ -1091,21 +960,28 @@ def page_new_invoice():
                     final_client_name = safe(cl, "name")
                     final_client_addr = safe(cl, "address", "")
 
-            inv_id = db.q_id(
-                "INSERT INTO fp_invoices (company_id, number, type, client_id, client_name, client_address, date_issue, date_due, status, subtotal, tax_total, total, notes, payment_terms, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (cid, invoice_number, inv_type, final_client_id, final_client_name, final_client_addr,
-                 date_issue, date_due, status, subtotal, tax_total, total_ttc, notes, payment_terms,
-                 safe(st.session_state.user,"id"))
-            )
+            inv = db.insert("fp_invoices", {
+                "company_id": cid, "number": invoice_number, "type": inv_type,
+                "client_id": final_client_id, "client_name": final_client_name,
+                "client_address": final_client_addr,
+                "date_issue": str(date_issue), "date_due": str(date_due),
+                "status": status, "subtotal": subtotal, "tax_total": tax_total,
+                "total": total_ttc, "notes": notes, "payment_terms": payment_terms,
+                "created_by": safe(st.session_state.user, "id")
+            })
+            inv_id = safe(inv, "id") if inv else None
 
             if inv_id:
                 for pos, line in enumerate(lines_data):
-                    db.q(
-                        "INSERT INTO fp_invoice_lines (invoice_id, position, description, quantity, unit_price, discount_pct, total) VALUES (?,?,?,?,?,?,?)",
-                        (inv_id, pos, line["desc"], line["qty"], line["price"], line["disc"], line["total"])
-                    )
+                    db.insert("fp_invoice_lines", {
+                        "invoice_id": inv_id, "position": pos,
+                        "description": line["desc"], "quantity": line["qty"],
+                        "unit_price": line["price"], "discount_pct": line["disc"],
+                        "total": line["total"]
+                    })
                 # Incrementer sequence
-                db.q("UPDATE fp_companies SET numbering_seq=numbering_seq+1 WHERE id=?", (cid,))
+                new_seq = int(safe(company, "numbering_seq", 1)) + 1
+                db.update("fp_companies", {"numbering_seq": new_seq}, {"id": cid})
 
                 st.success(f"Facture {invoice_number} enregistree!")
                 st.session_state.invoice_lines = [{"desc": "", "qty": 1, "price": 0, "disc": 0}]
@@ -1137,7 +1013,8 @@ def page_invoices():
     with col_f3:
         filter_type = st.selectbox("Type", ["Tous", "Facture", "Devis", "Bon de Livraison", "Avoir"], key="inv_ftype")
 
-    invoices = db.fa("SELECT * FROM fp_invoices WHERE company_id=? ORDER BY created_at DESC", (cid,))
+    invoices = db.fa("fp_invoices", {"company_id": cid})
+    invoices = sorted(invoices, key=lambda x: str(safe(x,"created_at","")), reverse=True)
 
     # Appliquer filtres
     if search:
@@ -1169,7 +1046,8 @@ def page_invoices():
     # Action paiement rapide
     st.markdown("---")
     st.markdown("#### Enregistrer un Paiement")
-    inv_nums = [safe(i, "number") for i in db.fa("SELECT * FROM fp_invoices WHERE company_id=? AND status IN ('unpaid','partial')", (cid,))]
+    all_inv = db.fa("fp_invoices", {"company_id": cid})
+    inv_nums = [safe(i, "number") for i in all_inv if safe(i,"status") in ["unpaid","partial"]]
     if inv_nums:
         with st.form("quick_payment", border=False):
             cp1, cp2, cp3 = st.columns(3)
@@ -1180,13 +1058,17 @@ def page_invoices():
             pay_date = st.date_input("Date paiement", value=date.today())
 
             if st.form_submit_button("Valider le Paiement", type="primary"):
-                inv = db.f1("SELECT * FROM fp_invoices WHERE number=? AND company_id=?", (pay_inv, cid))
+                inv_list = [i for i in all_inv if safe(i,"number") == pay_inv]
+                inv = inv_list[0] if inv_list else None
                 if inv and pay_amt > 0:
-                    db.q("INSERT INTO fp_payments (invoice_id, company_id, amount, method, reference, date_payment) VALUES (?,?,?,?,?,?)",
-                        (safe(inv,"id"), cid, pay_amt, pay_meth, pay_ref, pay_date))
-                    new_paid = safe(inv, "amount_paid", 0) + pay_amt
-                    new_status = "paid" if new_paid >= safe(inv, "total", 0) else "partial"
-                    db.q("UPDATE fp_invoices SET amount_paid=?, status=? WHERE id=?", (new_paid, new_status, safe(inv,"id")))
+                    db.insert("fp_payments", {
+                        "invoice_id": safe(inv,"id"), "company_id": cid,
+                        "amount": pay_amt, "method": pay_meth,
+                        "reference": pay_ref, "date_payment": str(pay_date)
+                    })
+                    new_paid = float(safe(inv, "amount_paid", 0) or 0) + pay_amt
+                    new_status = "paid" if new_paid >= float(safe(inv, "total", 0) or 0) else "partial"
+                    db.update("fp_invoices", {"amount_paid": new_paid, "status": new_status}, {"id": safe(inv,"id")})
                     st.success(f"Paiement de {format_amount(pay_amt, currency)} enregistre!")
                     st.rerun()
     else:
@@ -1228,9 +1110,12 @@ def page_clients():
 
             if submitted:
                 if cl_name:
-                    ok = db.q("INSERT INTO fp_clients (company_id, name, email, tel, address, ifu, rccm, notes, payment_terms) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (cid, cl_name, cl_email, cl_tel, cl_addr, cl_ifu, cl_rccm, cl_notes, cl_terms))
-                    if ok:
+                    row = db.insert("fp_clients", {
+                        "company_id": cid, "name": cl_name, "email": cl_email,
+                        "tel": cl_tel, "address": cl_addr, "ifu": cl_ifu,
+                        "rccm": cl_rccm, "notes": cl_notes, "payment_terms": cl_terms
+                    })
+                    if row:
                         st.success(f"Client {cl_name} ajoute!")
                         st.session_state.show_client_form = False
                         st.rerun()
@@ -1241,7 +1126,7 @@ def page_clients():
 
     # Liste des clients
     search_cl = st.text_input("Rechercher un client", placeholder="Nom, email, telephone...")
-    clients = db.fa("SELECT * FROM fp_clients WHERE company_id=? ORDER BY name", (cid,))
+    clients = sorted(db.fa("fp_clients", {"company_id": cid}), key=lambda x: safe(x,"name",""))
     if search_cl:
         clients = [c for c in clients if search_cl.lower() in safe(c,"name","").lower() or search_cl.lower() in safe(c,"email","").lower()]
 
@@ -1289,8 +1174,11 @@ def page_products():
             with col_pb1:
                 if st.form_submit_button("Enregistrer", type="primary", use_container_width=True):
                     if p_name:
-                        db.q("INSERT INTO fp_products (company_id, code, name, description, unit, price, tax_rate, category) VALUES (?,?,?,?,?,?,?,?)",
-                            (cid, p_code, p_name, p_desc, p_unit, p_price, p_tax, p_cat))
+                        db.insert("fp_products", {
+                            "company_id": cid, "code": p_code, "name": p_name,
+                            "description": p_desc, "unit": p_unit, "price": p_price,
+                            "tax_rate": p_tax, "category": p_cat
+                        })
                         st.success(f"Produit {p_name} ajoute!")
                         st.session_state.show_product_form = False
                         st.rerun()
@@ -1299,7 +1187,7 @@ def page_products():
                     st.session_state.show_product_form = False
                     st.rerun()
 
-    products = db.fa("SELECT * FROM fp_products WHERE company_id=? ORDER BY name", (cid,))
+    products = sorted(db.fa("fp_products", {"company_id": cid}), key=lambda x: safe(x,"name",""))
     if products:
         table_html = '<div class="fp-card"><table class="fp-table"><thead><tr><th>CODE</th><th>DESIGNATION</th><th>UNITE</th><th>PRIX HT</th><th>TAXE</th><th>CATEGORIE</th></tr></thead><tbody>'
         for p in products:
@@ -1323,8 +1211,8 @@ def page_reports():
 
     st.markdown("#### Rapports & Analyses")
 
-    invoices = db.fa("SELECT * FROM fp_invoices WHERE company_id=?", (cid,))
-    payments = db.fa("SELECT * FROM fp_payments WHERE company_id=?", (cid,))
+    invoices = db.fa("fp_invoices", {"company_id": cid})
+    payments = db.fa("fp_payments", {"company_id": cid})
 
     # Stats globales
     col1, col2, col3, col4 = st.columns(4)
@@ -1379,7 +1267,7 @@ def page_reports():
 
 def page_settings():
     cid = safe(st.session_state.company, "id")
-    company = db.f1("SELECT * FROM fp_companies WHERE id=?", (cid,)) if cid else None
+    company = db.f1("fp_companies", {"id": cid}) if cid else None
 
     st.markdown("#### Parametres de la Societe")
 
@@ -1409,9 +1297,13 @@ def page_settings():
 
         if st.form_submit_button("Sauvegarder", type="primary", use_container_width=True):
             if cid:
-                db.q("UPDATE fp_companies SET name=?,email=?,tel=?,address=?,website=?,ifu=?,rccm=?,bank=?,bank_account=?,currency=?,numbering_prefix=?,numbering_seq=? WHERE id=?",
-                    (co_name, co_email, co_tel, co_address, co_website, co_ifu, co_rccm, co_bank, co_account, co_currency, co_prefix, co_seq, cid))
-                st.session_state.company = db.f1("SELECT * FROM fp_companies WHERE id=?", (cid,))
+                db.update("fp_companies", {
+                    "name": co_name, "email": co_email, "tel": co_tel,
+                    "address": co_address, "website": co_website, "ifu": co_ifu,
+                    "rccm": co_rccm, "bank": co_bank, "bank_account": co_account,
+                    "currency": co_currency, "numbering_prefix": co_prefix, "numbering_seq": co_seq
+                }, {"id": cid})
+                st.session_state.company = db.f1("fp_companies", {"id": cid})
                 st.success("Parametres sauvegardes!")
 
 
@@ -1419,7 +1311,7 @@ def page_users():
     cid = safe(st.session_state.company, "id")
     st.markdown("#### Gestion des Utilisateurs")
 
-    users = db.fa("SELECT * FROM fp_users WHERE company_id=? ORDER BY created_at DESC", (cid,))
+    users = sorted(db.fa("fp_users", {"company_id": cid}), key=lambda x: str(safe(x,"created_at","")), reverse=True)
 
     with st.form("new_user_form", border=False):
         st.markdown("##### Ajouter un Utilisateur")
@@ -1435,8 +1327,11 @@ def page_users():
 
         if st.form_submit_button("Ajouter", type="primary"):
             if u_email and u_pwd and u_nom:
-                db.q("INSERT INTO fp_users (nom, prenom, email, password_hash, role, company_id) VALUES (?,?,?,?,?,?)",
-                    (u_nom, u_prenom, u_email.lower(), hash_pwd(u_pwd), u_role, cid))
+                db.insert("fp_users", {
+                    "nom": u_nom, "prenom": u_prenom,
+                    "email": u_email.lower(), "password_hash": hash_pwd(u_pwd),
+                    "role": u_role, "company_id": cid, "status": "actif"
+                })
                 st.success("Utilisateur ajoute!")
                 st.rerun()
 
