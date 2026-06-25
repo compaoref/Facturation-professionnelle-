@@ -2,9 +2,9 @@ import streamlit as st
 import hashlib
 import json
 import os
+import requests
 from datetime import datetime, date
 import streamlit.components.v1 as components
-from supabase import create_client, Client
 
 st.set_page_config(
     page_title="FacturaPro — Gestion Commerciale",
@@ -14,47 +14,67 @@ st.set_page_config(
 )
 
 # =============================================
-# CONFIGURATION BASE DE DONNEES (SUPABASE)
+# CONFIGURATION BASE DE DONNEES (SUPABASE REST)
+# requests est pre-installe sur Streamlit Cloud
+# Aucun package externe requis!
 # =============================================
 
-@st.cache_resource
-def get_supabase() -> Client:
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
-    except Exception as e:
-        return None
-
-
 class DB:
+    """
+    Acces Supabase via API REST avec requests.
+    Aucune dependance externe - requests est inclus dans Python.
+    """
     def __init__(self):
-        self._sb = get_supabase()
+        try:
+            self._url  = st.secrets["SUPABASE_URL"].rstrip("/")
+            self._key  = st.secrets["SUPABASE_KEY"]
+            self._hdrs = {
+                "apikey":        self._key,
+                "Authorization": f"Bearer {self._key}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=representation",
+            }
+        except Exception:
+            self._url  = ""
+            self._key  = ""
+            self._hdrs = {}
+
+    def _endpoint(self, table):
+        return f"{self._url}/rest/v1/{table}"
 
     def is_connected(self):
+        if not self._url or not self._key:
+            return False
         try:
-            if not self._sb:
-                return False
-            self._sb.table("fp_companies").select("id").limit(1).execute()
-            return True
+            r = requests.get(
+                self._endpoint("fp_companies"),
+                headers=self._hdrs,
+                params={"limit": 1},
+                timeout=8
+            )
+            return r.status_code in (200, 206)
         except Exception:
             return False
 
-    # ---- LECTURE ----
     def fa(self, table, filters=None, order=None, limit=None):
-        """Retourne une liste de dicts depuis une table"""
+        """Retourne une liste de dicts"""
         try:
-            q = self._sb.table(table).select("*")
+            params = {"select": "*"}
             if filters:
                 for col, val in filters.items():
-                    q = q.eq(col, val)
+                    params[col] = f"eq.{val}"
             if order:
-                q = q.order(order, desc=True)
+                params["order"] = f"{order}.desc"
             if limit:
-                q = q.limit(limit)
-            r = q.execute()
-            return r.data if r.data else []
-        except Exception as e:
+                params["limit"] = limit
+            r = requests.get(
+                self._endpoint(table),
+                headers=self._hdrs,
+                params=params,
+                timeout=10
+            )
+            return r.json() if r.status_code == 200 else []
+        except Exception:
             return []
 
     def f1(self, table, filters=None):
@@ -62,59 +82,80 @@ class DB:
         rows = self.fa(table, filters=filters, limit=1)
         return rows[0] if rows else None
 
-    def fa_sql(self, sql):
-        """Requete SQL brute via rpc (pour les requetes complexes)"""
-        try:
-            r = self._sb.rpc("run_sql", {"query": sql}).execute()
-            return r.data if r.data else []
-        except Exception:
-            return []
-
-    # ---- ECRITURE ----
     def insert(self, table, data):
         """INSERT - retourne la ligne inseree"""
         try:
-            r = self._sb.table(table).insert(data).execute()
-            return r.data[0] if r.data else None
+            # Convertir les dates en string
+            clean = {}
+            for k, v in data.items():
+                if isinstance(v, (datetime, date)):
+                    clean[k] = v.isoformat()
+                else:
+                    clean[k] = v
+            r = requests.post(
+                self._endpoint(table),
+                headers=self._hdrs,
+                json=clean,
+                timeout=10
+            )
+            if r.status_code in (200, 201):
+                result = r.json()
+                return result[0] if isinstance(result, list) else result
+            return None
         except Exception as e:
-            st.warning(f"Erreur insert {table}: {str(e)[:100]}")
+            st.warning(f"Erreur insert: {str(e)[:80]}")
             return None
 
     def update(self, table, data, filters):
         """UPDATE"""
         try:
-            q = self._sb.table(table).update(data)
+            params = {}
             for col, val in filters.items():
-                q = q.eq(col, val)
-            r = q.execute()
-            return True
-        except Exception as e:
-            st.warning(f"Erreur update {table}: {str(e)[:100]}")
+                params[col] = f"eq.{val}"
+            clean = {}
+            for k, v in data.items():
+                if isinstance(v, (datetime, date)):
+                    clean[k] = v.isoformat()
+                else:
+                    clean[k] = v
+            r = requests.patch(
+                self._endpoint(table),
+                headers=self._hdrs,
+                params=params,
+                json=clean,
+                timeout=10
+            )
+            return r.status_code in (200, 204)
+        except Exception:
             return False
 
     def delete(self, table, filters):
         """DELETE"""
         try:
-            q = self._sb.table(table).delete()
+            params = {}
             for col, val in filters.items():
-                q = q.eq(col, val)
-            q.execute()
-            return True
-        except Exception as e:
+                params[col] = f"eq.{val}"
+            r = requests.delete(
+                self._endpoint(table),
+                headers=self._hdrs,
+                params=params,
+                timeout=10
+            )
+            return r.status_code in (200, 204)
+        except Exception:
             return False
 
     def fa_filter(self, table, col, op, val):
-        """Filtre avec operateur: eq, neq, gt, lt, in_"""
+        """Filtre avec operateur: eq, neq, gt, lt, ilike"""
         try:
-            q = self._sb.table(table).select("*")
-            if op == "eq":   q = q.eq(col, val)
-            elif op == "neq": q = q.neq(col, val)
-            elif op == "gt":  q = q.gt(col, val)
-            elif op == "lt":  q = q.lt(col, val)
-            elif op == "in":  q = q.in_(col, val)
-            elif op == "ilike": q = q.ilike(col, f"%{val}%")
-            r = q.execute()
-            return r.data if r.data else []
+            params = {"select": "*", col: f"{op}.{val}"}
+            r = requests.get(
+                self._endpoint(table),
+                headers=self._hdrs,
+                params=params,
+                timeout=10
+            )
+            return r.json() if r.status_code == 200 else []
         except Exception:
             return []
 
