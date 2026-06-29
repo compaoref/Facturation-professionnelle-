@@ -2,9 +2,11 @@ import streamlit as st
 import hashlib
 import json
 import os
-import requests
+import re
 from datetime import datetime, date
 import streamlit.components.v1 as components
+import pg8000
+import pg8000.native
 
 st.set_page_config(
     page_title="FacturaPro — Gestion Commerciale",
@@ -14,150 +16,246 @@ st.set_page_config(
 )
 
 # =============================================
-# CONFIGURATION BASE DE DONNEES (SUPABASE REST)
-# requests est pre-installe sur Streamlit Cloud
-# Aucun package externe requis!
+# CONNEXION POSTGRESQL VIA pg8000
+# pg8000 = driver 100% Python, pas de compilation
+# Fonctionne parfaitement sur Streamlit Cloud
 # =============================================
 
-class DB:
-    """
-    Acces Supabase via API REST avec requests.
-    Aucune dependance externe - requests est inclus dans Python.
-    """
-    def __init__(self):
-        try:
-            self._url  = st.secrets["SUPABASE_URL"].rstrip("/")
-            self._key  = st.secrets["SUPABASE_KEY"]
-            self._hdrs = {
-                "apikey":        self._key,
-                "Authorization": f"Bearer {self._key}",
-                "Content-Type":  "application/json",
-                "Prefer":        "return=representation",
-            }
-        except Exception:
-            self._url  = ""
-            self._key  = ""
-            self._hdrs = {}
+def _parse_url(url: str):
+    """Parse postgresql://user:pwd@host:port/db"""
+    pattern = r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)"
+    m = re.match(pattern, url)
+    if not m:
+        raise ValueError(f"URL invalide: {url[:40]}...")
+    user, pwd, host, port, db = m.groups()
+    # Decoder les caracteres speciaux du mot de passe
+    from urllib.parse import unquote
+    pwd = unquote(pwd)
+    return user, pwd, host, int(port), db
 
-    def _endpoint(self, table):
-        return f"{self._url}/rest/v1/{table}"
+
+@st.cache_resource
+def get_pool():
+    """Cree le pool de connexions une seule fois"""
+    try:
+        url = st.secrets["DATABASE_URL"]
+        user, pwd, host, port, db = _parse_url(url)
+        return {"user": user, "password": pwd, "host": host,
+                "port": port, "database": db, "ssl_context": True}
+    except Exception as e:
+        return None
+
+
+def _get_conn():
+    """Ouvre une connexion depuis les params du pool"""
+    params = get_pool()
+    if not params:
+        return None
+    try:
+        conn = pg8000.native.Connection(
+            user=params["user"],
+            password=params["password"],
+            host=params["host"],
+            port=params["port"],
+            database=params["database"],
+            ssl_context=params["ssl_context"],
+        )
+        return conn
+    except Exception as e:
+        st.warning(f"Connexion BD: {str(e)[:100]}")
+        return None
+
+
+class DB:
+    """Couche acces BD avec pg8000 (pur Python)"""
 
     def is_connected(self):
-        if not self._url or not self._key:
+        conn = _get_conn()
+        if not conn:
             return False
         try:
-            r = requests.get(
-                self._endpoint("fp_companies"),
-                headers=self._hdrs,
-                params={"limit": 1},
-                timeout=8
-            )
-            return r.status_code in (200, 206)
+            conn.run("SELECT 1")
+            conn.close()
+            return True
         except Exception:
             return False
 
-    def fa(self, table, filters=None, order=None, limit=None):
-        """Retourne une liste de dicts"""
+    def init(self):
+        """Cree les tables si elles n'existent pas"""
+        conn = _get_conn()
+        if not conn:
+            return
+        tables = [
+            """CREATE TABLE IF NOT EXISTS fp_companies (
+                id SERIAL PRIMARY KEY, name TEXT NOT NULL,
+                address TEXT, tel TEXT, email TEXT, website TEXT,
+                ifu TEXT, rccm TEXT, bank TEXT, bank_account TEXT,
+                currency TEXT DEFAULT 'XOF',
+                numbering_prefix TEXT DEFAULT 'FAC',
+                numbering_seq INTEGER DEFAULT 1,
+                owner_id INTEGER, created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS fp_users (
+                id SERIAL PRIMARY KEY, nom TEXT, prenom TEXT,
+                email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'user', company_id INTEGER,
+                status TEXT DEFAULT 'actif', created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS fp_clients (
+                id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL,
+                code TEXT, name TEXT NOT NULL, address TEXT,
+                tel TEXT, email TEXT, ifu TEXT, rccm TEXT,
+                payment_terms TEXT DEFAULT '30j', notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS fp_products (
+                id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL,
+                code TEXT, name TEXT NOT NULL, description TEXT,
+                unit TEXT DEFAULT 'u', price REAL DEFAULT 0,
+                tax_rate REAL DEFAULT 18, category TEXT,
+                active INTEGER DEFAULT 1
+            )""",
+            """CREATE TABLE IF NOT EXISTS fp_invoices (
+                id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL,
+                number TEXT NOT NULL, type TEXT DEFAULT 'Facture',
+                client_id INTEGER, client_name TEXT, client_address TEXT,
+                date_issue DATE DEFAULT CURRENT_DATE, date_due DATE,
+                status TEXT DEFAULT 'draft', subtotal REAL DEFAULT 0,
+                tax_total REAL DEFAULT 0, total REAL DEFAULT 0,
+                amount_paid REAL DEFAULT 0, notes TEXT,
+                payment_terms TEXT, created_by INTEGER,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS fp_invoice_lines (
+                id SERIAL PRIMARY KEY, invoice_id INTEGER NOT NULL,
+                position INTEGER DEFAULT 0, description TEXT,
+                quantity REAL DEFAULT 1, unit TEXT DEFAULT 'u',
+                unit_price REAL DEFAULT 0, discount_pct REAL DEFAULT 0,
+                total REAL DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS fp_payments (
+                id SERIAL PRIMARY KEY, invoice_id INTEGER NOT NULL,
+                company_id INTEGER NOT NULL, amount REAL NOT NULL,
+                method TEXT DEFAULT 'Especes', reference TEXT,
+                date_payment DATE DEFAULT CURRENT_DATE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+        ]
         try:
-            params = {"select": "*"}
+            for sql in tables:
+                conn.run(sql)
+            conn.close()
+        except Exception as e:
+            st.warning(f"Init tables: {str(e)[:100]}")
+
+    def _rows_to_dicts(self, conn, sql, params=()):
+        """Execute une requete et retourne une liste de dicts"""
+        try:
+            if params:
+                rows = conn.run(sql, *params)
+            else:
+                rows = conn.run(sql)
+            cols = [d["name"] for d in conn.columns]
+            return [dict(zip(cols, row)) for row in rows] if rows else []
+        except Exception as e:
+            st.warning(f"Erreur lecture: {str(e)[:100]}")
+            return []
+
+    def fa(self, table, filters=None, order=None, limit=None):
+        """SELECT * avec filtres optionnels"""
+        conn = _get_conn()
+        if not conn:
+            return []
+        try:
+            sql = f"SELECT * FROM {table}"
+            params = []
             if filters:
+                clauses = []
                 for col, val in filters.items():
-                    params[col] = f"eq.{val}"
+                    params.append(val)
+                    clauses.append(f"{col} = :{len(params)}")
+                sql += " WHERE " + " AND ".join(clauses)
             if order:
-                params["order"] = f"{order}.desc"
+                sql += f" ORDER BY {order} DESC"
             if limit:
-                params["limit"] = limit
-            r = requests.get(
-                self._endpoint(table),
-                headers=self._hdrs,
-                params=params,
-                timeout=10
-            )
-            return r.json() if r.status_code == 200 else []
-        except Exception:
+                sql += f" LIMIT {limit}"
+            result = self._rows_to_dicts(conn, sql, params)
+            conn.close()
+            return result
+        except Exception as e:
+            st.warning(f"Erreur fa: {str(e)[:100]}")
             return []
 
     def f1(self, table, filters=None):
-        """Retourne une seule ligne"""
+        """SELECT une seule ligne"""
         rows = self.fa(table, filters=filters, limit=1)
         return rows[0] if rows else None
 
     def insert(self, table, data):
-        """INSERT - retourne la ligne inseree"""
+        """INSERT et retourne la ligne inseree"""
+        conn = _get_conn()
+        if not conn:
+            return None
         try:
-            # Convertir les dates en string
             clean = {}
             for k, v in data.items():
                 if isinstance(v, (datetime, date)):
                     clean[k] = v.isoformat()
                 else:
                     clean[k] = v
-            r = requests.post(
-                self._endpoint(table),
-                headers=self._hdrs,
-                json=clean,
-                timeout=10
-            )
-            if r.status_code in (200, 201):
-                result = r.json()
-                return result[0] if isinstance(result, list) else result
-            return None
+            cols = list(clean.keys())
+            vals = list(clean.values())
+            placeholders = [f":{i+1}" for i in range(len(vals))]
+            sql = (f"INSERT INTO {table} ({', '.join(cols)}) "
+                   f"VALUES ({', '.join(placeholders)}) RETURNING *")
+            rows = self._rows_to_dicts(conn, sql, vals)
+            conn.close()
+            return rows[0] if rows else None
         except Exception as e:
-            st.warning(f"Erreur insert: {str(e)[:80]}")
+            st.warning(f"Erreur insert: {str(e)[:100]}")
             return None
 
     def update(self, table, data, filters):
         """UPDATE"""
+        conn = _get_conn()
+        if not conn:
+            return False
         try:
-            params = {}
+            vals = []
+            set_clauses = []
+            for col, val in data.items():
+                vals.append(val)
+                set_clauses.append(f"{col} = :{len(vals)}")
+            where_clauses = []
             for col, val in filters.items():
-                params[col] = f"eq.{val}"
-            clean = {}
-            for k, v in data.items():
-                if isinstance(v, (datetime, date)):
-                    clean[k] = v.isoformat()
-                else:
-                    clean[k] = v
-            r = requests.patch(
-                self._endpoint(table),
-                headers=self._hdrs,
-                params=params,
-                json=clean,
-                timeout=10
-            )
-            return r.status_code in (200, 204)
-        except Exception:
+                vals.append(val)
+                where_clauses.append(f"{col} = :{len(vals)}")
+            sql = (f"UPDATE {table} SET {', '.join(set_clauses)} "
+                   f"WHERE {' AND '.join(where_clauses)}")
+            conn.run(sql, *vals)
+            conn.close()
+            return True
+        except Exception as e:
+            st.warning(f"Erreur update: {str(e)[:100]}")
             return False
 
     def delete(self, table, filters):
         """DELETE"""
-        try:
-            params = {}
-            for col, val in filters.items():
-                params[col] = f"eq.{val}"
-            r = requests.delete(
-                self._endpoint(table),
-                headers=self._hdrs,
-                params=params,
-                timeout=10
-            )
-            return r.status_code in (200, 204)
-        except Exception:
+        conn = _get_conn()
+        if not conn:
             return False
-
-    def fa_filter(self, table, col, op, val):
-        """Filtre avec operateur: eq, neq, gt, lt, ilike"""
         try:
-            params = {"select": "*", col: f"{op}.{val}"}
-            r = requests.get(
-                self._endpoint(table),
-                headers=self._hdrs,
-                params=params,
-                timeout=10
-            )
-            return r.json() if r.status_code == 200 else []
-        except Exception:
-            return []
+            vals = []
+            clauses = []
+            for col, val in filters.items():
+                vals.append(val)
+                clauses.append(f"{col} = :{len(vals)}")
+            sql = f"DELETE FROM {table} WHERE {' AND '.join(clauses)}"
+            conn.run(sql, *vals)
+            conn.close()
+            return True
+        except Exception as e:
+            return False
 
 
 db = DB()
@@ -203,7 +301,9 @@ for k, v in {
 # INIT DB
 # =============================================
 
-# BD Supabase: tables créées manuellement via SQL Editor
+if "db_initialized" not in st.session_state:
+    db.init()
+    st.session_state.db_initialized = True
 
 # =============================================
 # CSS GLOBAL PROFESSIONNEL
@@ -616,18 +716,15 @@ div[data-testid="stTabs"] [data-testid="stTab"] {
 # =============================================
 
 def check_db():
-    """Verifie et affiche etat BD"""
-    if "SUPABASE_URL" not in st.secrets or "SUPABASE_KEY" not in st.secrets:
-        st.error("SUPABASE_URL et SUPABASE_KEY manquants dans les secrets Streamlit!")
-        st.code('''SUPABASE_URL = "https://XXXX.supabase.co"
-SUPABASE_KEY = "votre_anon_key_supabase"''', language="toml")
+    """Verifie la connexion BD et affiche un message clair si erreur"""
+    if "DATABASE_URL" not in st.secrets:
+        st.error("DATABASE_URL manquant dans les secrets Streamlit!")
+        st.markdown("### Ajouter dans Settings → Secrets:")
+        st.code('DATABASE_URL = "postgresql://postgres.XXXX:MOT_DE_PASSE@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"', language="toml")
         st.stop()
     if not db.is_connected():
         st.error("Impossible de se connecter a Supabase.")
-        st.markdown("Verifiez SUPABASE_URL et SUPABASE_KEY dans Settings → Secrets")
-        st.code("""SUPABASE_URL = \"https://XXXX.supabase.co\"
-SUPABASE_KEY = \"votre_anon_key\"
-""", language="toml")
+        st.markdown("Verifiez que DATABASE_URL est correct et que le projet Supabase est actif.")
         if st.button("Reessayer"):
             st.rerun()
         st.stop()
