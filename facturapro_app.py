@@ -1,12 +1,12 @@
 import streamlit as st
 import hashlib
 import json
-import os
 import re
 from datetime import datetime, date
+import urllib.request
+import urllib.parse
+import urllib.error
 import streamlit.components.v1 as components
-import pg8000
-import pg8000.native
 
 st.set_page_config(
     page_title="FacturaPro — Gestion Commerciale",
@@ -16,175 +16,88 @@ st.set_page_config(
 )
 
 # =============================================
-# CONNEXION POSTGRESQL VIA pg8000
-# pg8000 = driver 100% Python, pas de compilation
-# Fonctionne parfaitement sur Streamlit Cloud
+# BASE DE DONNEES VIA SUPABASE REST API
+# Utilise urllib — integre dans Python standard
+# AUCUN package externe requis!
+# Fonctionne sur TOUS les environnements
 # =============================================
 
-def _parse_url(url: str):
-    """Parse postgresql://user:pwd@host:port/db"""
-    pattern = r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)"
-    m = re.match(pattern, url)
-    if not m:
-        raise ValueError(f"URL invalide: {url[:40]}...")
-    user, pwd, host, port, db = m.groups()
-    # Decoder les caracteres speciaux du mot de passe
-    from urllib.parse import unquote
-    pwd = unquote(pwd)
-    return user, pwd, host, int(port), db
-
-
-@st.cache_resource
-def get_pool():
-    """Cree le pool de connexions une seule fois"""
-    try:
-        url = st.secrets["DATABASE_URL"]
-        user, pwd, host, port, db = _parse_url(url)
-        return {"user": user, "password": pwd, "host": host,
-                "port": port, "database": db, "ssl_context": True}
-    except Exception as e:
-        return None
-
-
-def _get_conn():
-    """Ouvre une connexion depuis les params du pool"""
-    params = get_pool()
-    if not params:
-        return None
-    try:
-        conn = pg8000.native.Connection(
-            user=params["user"],
-            password=params["password"],
-            host=params["host"],
-            port=params["port"],
-            database=params["database"],
-            ssl_context=params["ssl_context"],
-        )
-        return conn
-    except Exception as e:
-        st.warning(f"Connexion BD: {str(e)[:100]}")
-        return None
-
-
 class DB:
-    """Couche acces BD avec pg8000 (pur Python)"""
+    """
+    Acces Supabase via API REST avec urllib (Python standard).
+    Zero dependance externe. Fonctionne partout.
+    Secrets requis: SUPABASE_URL + SUPABASE_KEY
+    """
+
+    def __init__(self):
+        try:
+            self._url = st.secrets["SUPABASE_URL"].rstrip("/")
+            self._key = st.secrets["SUPABASE_KEY"]
+        except Exception:
+            self._url = ""
+            self._key = ""
+
+    def _headers(self, extra=None):
+        h = {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        if extra:
+            h.update(extra)
+        return h
+
+    def _request(self, method, path, params=None, body=None):
+        """Execute une requete HTTP vers l'API Supabase"""
+        if not self._url or not self._key:
+            return None, 0
+        url = f"{self._url}/rest/v1/{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(
+            url, data=data,
+            headers=self._headers(),
+            method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                content = resp.read().decode("utf-8")
+                return json.loads(content) if content else [], resp.status
+        except urllib.error.HTTPError as e:
+            content = e.read().decode("utf-8")
+            try:
+                err = json.loads(content)
+                st.warning(f"BD {method} {path}: {err.get('message', str(e))[:100]}")
+            except Exception:
+                st.warning(f"BD erreur {e.code}: {content[:100]}")
+            return None, e.code
+        except Exception as e:
+            st.warning(f"BD connexion: {str(e)[:100]}")
+            return None, 0
 
     def is_connected(self):
-        conn = _get_conn()
-        if not conn:
+        if not self._url or not self._key:
             return False
         try:
-            conn.run("SELECT 1")
-            conn.close()
-            return True
+            _, code = self._request("GET", "fp_companies", {"limit": 1})
+            return code in (200, 206)
         except Exception:
             return False
 
-    def init(self):
-        """Cree les tables si elles n'existent pas"""
-        conn = _get_conn()
-        if not conn:
-            return
-        tables = [
-            """CREATE TABLE IF NOT EXISTS fp_companies (
-                id SERIAL PRIMARY KEY, name TEXT NOT NULL,
-                address TEXT, tel TEXT, email TEXT, website TEXT,
-                ifu TEXT, rccm TEXT, bank TEXT, bank_account TEXT,
-                currency TEXT DEFAULT 'XOF',
-                numbering_prefix TEXT DEFAULT 'FAC',
-                numbering_seq INTEGER DEFAULT 1,
-                owner_id INTEGER, created_at TIMESTAMP DEFAULT NOW()
-            )""",
-            """CREATE TABLE IF NOT EXISTS fp_users (
-                id SERIAL PRIMARY KEY, nom TEXT, prenom TEXT,
-                email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-                role TEXT DEFAULT 'user', company_id INTEGER,
-                status TEXT DEFAULT 'actif', created_at TIMESTAMP DEFAULT NOW()
-            )""",
-            """CREATE TABLE IF NOT EXISTS fp_clients (
-                id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL,
-                code TEXT, name TEXT NOT NULL, address TEXT,
-                tel TEXT, email TEXT, ifu TEXT, rccm TEXT,
-                payment_terms TEXT DEFAULT '30j', notes TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )""",
-            """CREATE TABLE IF NOT EXISTS fp_products (
-                id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL,
-                code TEXT, name TEXT NOT NULL, description TEXT,
-                unit TEXT DEFAULT 'u', price REAL DEFAULT 0,
-                tax_rate REAL DEFAULT 18, category TEXT,
-                active INTEGER DEFAULT 1
-            )""",
-            """CREATE TABLE IF NOT EXISTS fp_invoices (
-                id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL,
-                number TEXT NOT NULL, type TEXT DEFAULT 'Facture',
-                client_id INTEGER, client_name TEXT, client_address TEXT,
-                date_issue DATE DEFAULT CURRENT_DATE, date_due DATE,
-                status TEXT DEFAULT 'draft', subtotal REAL DEFAULT 0,
-                tax_total REAL DEFAULT 0, total REAL DEFAULT 0,
-                amount_paid REAL DEFAULT 0, notes TEXT,
-                payment_terms TEXT, created_by INTEGER,
-                created_at TIMESTAMP DEFAULT NOW()
-            )""",
-            """CREATE TABLE IF NOT EXISTS fp_invoice_lines (
-                id SERIAL PRIMARY KEY, invoice_id INTEGER NOT NULL,
-                position INTEGER DEFAULT 0, description TEXT,
-                quantity REAL DEFAULT 1, unit TEXT DEFAULT 'u',
-                unit_price REAL DEFAULT 0, discount_pct REAL DEFAULT 0,
-                total REAL DEFAULT 0
-            )""",
-            """CREATE TABLE IF NOT EXISTS fp_payments (
-                id SERIAL PRIMARY KEY, invoice_id INTEGER NOT NULL,
-                company_id INTEGER NOT NULL, amount REAL NOT NULL,
-                method TEXT DEFAULT 'Especes', reference TEXT,
-                date_payment DATE DEFAULT CURRENT_DATE,
-                created_at TIMESTAMP DEFAULT NOW()
-            )""",
-        ]
-        try:
-            for sql in tables:
-                conn.run(sql)
-            conn.close()
-        except Exception as e:
-            st.warning(f"Init tables: {str(e)[:100]}")
-
-    def _rows_to_dicts(self, conn, sql, params=()):
-        """Execute une requete et retourne une liste de dicts"""
-        try:
-            if params:
-                rows = conn.run(sql, *params)
-            else:
-                rows = conn.run(sql)
-            cols = [d["name"] for d in conn.columns]
-            return [dict(zip(cols, row)) for row in rows] if rows else []
-        except Exception as e:
-            st.warning(f"Erreur lecture: {str(e)[:100]}")
-            return []
-
     def fa(self, table, filters=None, order=None, limit=None):
-        """SELECT * avec filtres optionnels"""
-        conn = _get_conn()
-        if not conn:
-            return []
-        try:
-            sql = f"SELECT * FROM {table}"
-            params = []
-            if filters:
-                clauses = []
-                for col, val in filters.items():
-                    params.append(val)
-                    clauses.append(f"{col} = :{len(params)}")
-                sql += " WHERE " + " AND ".join(clauses)
-            if order:
-                sql += f" ORDER BY {order} DESC"
-            if limit:
-                sql += f" LIMIT {limit}"
-            result = self._rows_to_dicts(conn, sql, params)
-            conn.close()
-            return result
-        except Exception as e:
-            st.warning(f"Erreur fa: {str(e)[:100]}")
-            return []
+        """SELECT * — retourne une liste de dicts"""
+        params = {"select": "*"}
+        if filters:
+            for col, val in filters.items():
+                params[col] = f"eq.{val}"
+        if order:
+            params["order"] = f"{order}.desc"
+        if limit:
+            params["limit"] = limit
+        data, code = self._request("GET", table, params=params)
+        return data if isinstance(data, list) else []
 
     def f1(self, table, filters=None):
         """SELECT une seule ligne"""
@@ -192,70 +105,43 @@ class DB:
         return rows[0] if rows else None
 
     def insert(self, table, data):
-        """INSERT et retourne la ligne inseree"""
-        conn = _get_conn()
-        if not conn:
-            return None
-        try:
-            clean = {}
-            for k, v in data.items():
-                if isinstance(v, (datetime, date)):
-                    clean[k] = v.isoformat()
-                else:
-                    clean[k] = v
-            cols = list(clean.keys())
-            vals = list(clean.values())
-            placeholders = [f":{i+1}" for i in range(len(vals))]
-            sql = (f"INSERT INTO {table} ({', '.join(cols)}) "
-                   f"VALUES ({', '.join(placeholders)}) RETURNING *")
-            rows = self._rows_to_dicts(conn, sql, vals)
-            conn.close()
-            return rows[0] if rows else None
-        except Exception as e:
-            st.warning(f"Erreur insert: {str(e)[:100]}")
-            return None
+        """INSERT — retourne la ligne inseree"""
+        clean = {}
+        for k, v in data.items():
+            if isinstance(v, (datetime, date)):
+                clean[k] = v.isoformat()
+            elif v is None:
+                clean[k] = None
+            else:
+                clean[k] = v
+        result, code = self._request("POST", table, body=clean)
+        if isinstance(result, list) and result:
+            return result[0]
+        if isinstance(result, dict):
+            return result
+        return None
 
     def update(self, table, data, filters):
         """UPDATE"""
-        conn = _get_conn()
-        if not conn:
-            return False
-        try:
-            vals = []
-            set_clauses = []
-            for col, val in data.items():
-                vals.append(val)
-                set_clauses.append(f"{col} = :{len(vals)}")
-            where_clauses = []
-            for col, val in filters.items():
-                vals.append(val)
-                where_clauses.append(f"{col} = :{len(vals)}")
-            sql = (f"UPDATE {table} SET {', '.join(set_clauses)} "
-                   f"WHERE {' AND '.join(where_clauses)}")
-            conn.run(sql, *vals)
-            conn.close()
-            return True
-        except Exception as e:
-            st.warning(f"Erreur update: {str(e)[:100]}")
-            return False
+        params = {}
+        for col, val in filters.items():
+            params[col] = f"eq.{val}"
+        clean = {}
+        for k, v in data.items():
+            if isinstance(v, (datetime, date)):
+                clean[k] = v.isoformat()
+            else:
+                clean[k] = v
+        _, code = self._request("PATCH", table, params=params, body=clean)
+        return code in (200, 204)
 
     def delete(self, table, filters):
         """DELETE"""
-        conn = _get_conn()
-        if not conn:
-            return False
-        try:
-            vals = []
-            clauses = []
-            for col, val in filters.items():
-                vals.append(val)
-                clauses.append(f"{col} = :{len(vals)}")
-            sql = f"DELETE FROM {table} WHERE {' AND '.join(clauses)}"
-            conn.run(sql, *vals)
-            conn.close()
-            return True
-        except Exception as e:
-            return False
+        params = {}
+        for col, val in filters.items():
+            params[col] = f"eq.{val}"
+        _, code = self._request("DELETE", table, params=params)
+        return code in (200, 204)
 
 
 db = DB()
@@ -301,9 +187,7 @@ for k, v in {
 # INIT DB
 # =============================================
 
-if "db_initialized" not in st.session_state:
-    db.init()
-    st.session_state.db_initialized = True
+# BD Supabase via REST API — tables creees dans Supabase SQL Editor
 
 # =============================================
 # CSS GLOBAL PROFESSIONNEL
@@ -716,15 +600,21 @@ div[data-testid="stTabs"] [data-testid="stTab"] {
 # =============================================
 
 def check_db():
-    """Verifie la connexion BD et affiche un message clair si erreur"""
-    if "DATABASE_URL" not in st.secrets:
-        st.error("DATABASE_URL manquant dans les secrets Streamlit!")
-        st.markdown("### Ajouter dans Settings → Secrets:")
-        st.code('DATABASE_URL = "postgresql://postgres.XXXX:MOT_DE_PASSE@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"', language="toml")
+    """Verifie la connexion BD"""
+    missing = []
+    if "SUPABASE_URL" not in st.secrets:
+        missing.append("SUPABASE_URL")
+    if "SUPABASE_KEY" not in st.secrets:
+        missing.append("SUPABASE_KEY")
+    if missing:
+        st.error(f"Secrets manquants: {', '.join(missing)}")
+        st.markdown("### Ajouter dans Streamlit Cloud → Settings → Secrets:")
+        st.code('''SUPABASE_URL = "https://XXXX.supabase.co"
+SUPABASE_KEY = "votre_anon_key"''', language="toml")
+        st.info("Trouver ces valeurs dans: Supabase → Project Settings → API")
         st.stop()
     if not db.is_connected():
-        st.error("Impossible de se connecter a Supabase.")
-        st.markdown("Verifiez que DATABASE_URL est correct et que le projet Supabase est actif.")
+        st.error("Impossible de se connecter. Verifiez SUPABASE_URL et SUPABASE_KEY.")
         if st.button("Reessayer"):
             st.rerun()
         st.stop()
